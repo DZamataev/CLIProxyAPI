@@ -183,6 +183,7 @@ func ConvertAntigravityResponseToGemini(ctx context.Context, _ string, originalR
 			chunkDoc := ojson.NewDoc([]byte("[]"))
 			responseResult := util.ParseGJSONBytesNoCopy(rawJSON)
 			if responseResult.IsArray() {
+				keptItems := 0
 				responseResultItems := responseResult.Array()
 				for i := 0; i < len(responseResultItems); i++ {
 					responseResultItem := responseResultItems[i]
@@ -190,8 +191,14 @@ func ConvertAntigravityResponseToGemini(ctx context.Context, _ string, originalR
 						item, onlyEmptyThoughts := stripEmptyThoughtParts([]byte(responseResultItem.Get("response").Raw))
 						if !onlyEmptyThoughts {
 							_ = chunkDoc.SetRawBytes("-1", item)
+							keptItems++
 						}
 					}
+				}
+				// Nothing survived filtering, so deliver no chunk at all instead of
+				// an empty array that clients read as an empty response.
+				if keptItems == 0 {
+					return [][]byte{}
 				}
 			}
 			chunk = chunkDoc.Bytes()
@@ -303,15 +310,17 @@ func stripEmptyThoughtParts(chunk []byte) ([]byte, bool) {
 	return chunkDoc.Bytes(), removedAny && nothingLeft
 }
 
+// isEmptyThoughtPart matches only `thought` as a JSON true and `text` absent or an empty
+// JSON string: ojson.Result.Bool/String would also accept "true", 1 and null.
 func isEmptyThoughtPart(part ojson.Result) bool {
-	if !part.IsObject() || !part.Get("thought").Bool() {
+	if !part.IsObject() || part.Get("thought").Type != ojson.True {
 		return false
 	}
 	for key, value := range part.Map() {
 		switch key {
 		case "thought":
 		case "text":
-			if value.String() != "" {
+			if value.Type != ojson.String || value.Str != "" {
 				return false
 			}
 		default:
