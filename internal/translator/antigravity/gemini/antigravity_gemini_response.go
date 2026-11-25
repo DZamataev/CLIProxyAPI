@@ -173,6 +173,11 @@ func ConvertAntigravityResponseToGemini(ctx context.Context, _ string, originalR
 				}
 				chunk = restoreUsageMetadata(chunk)
 				chunk = restoreGeminiFunctionNames(chunk, originalRequestRawJSON)
+				var onlyEmptyThoughts bool
+				chunk, onlyEmptyThoughts = stripEmptyThoughtParts(chunk)
+				if onlyEmptyThoughts {
+					return [][]byte{}
+				}
 			}
 		} else {
 			chunkDoc := ojson.NewDoc([]byte("[]"))
@@ -182,7 +187,10 @@ func ConvertAntigravityResponseToGemini(ctx context.Context, _ string, originalR
 				for i := 0; i < len(responseResultItems); i++ {
 					responseResultItem := responseResultItems[i]
 					if responseResultItem.Get("response").Exists() {
-						_ = chunkDoc.SetRaw("-1", responseResultItem.Get("response").Raw)
+						item, onlyEmptyThoughts := stripEmptyThoughtParts([]byte(responseResultItem.Get("response").Raw))
+						if !onlyEmptyThoughts {
+							_ = chunkDoc.SetRawBytes("-1", item)
+						}
 					}
 				}
 			}
@@ -221,6 +229,7 @@ func ConvertAntigravityResponseToGeminiNonStream(_ context.Context, _ string, or
 	} else {
 		chunk = restoreGeminiFunctionNames(rawJSON, originalRequestRawJSON)
 	}
+	chunk, _ = stripEmptyThoughtParts(chunk)
 	candidates := util.GetGJSONBytesNoCopy(chunk, "candidates")
 	if candidates.IsArray() {
 		// Default every candidate, not just the first one, so a multi-candidate
@@ -242,6 +251,74 @@ func ConvertAntigravityResponseToGeminiNonStream(_ context.Context, _ string, or
 		}
 	}
 	return chunk
+}
+
+var thoughtFieldMarker = []byte(`"thought"`)
+
+// stripEmptyThoughtParts drops parts that carry nothing but `"thought":true` and an
+// empty text. Antigravity flash-lite models emit such parts ahead of every answer even
+// when thoughts are not requested; Gemini API clients such as the Antigravity CLI then
+// read the response as empty (its search_web summary comes back blank). Parts with a
+// thoughtSignature or any other field are kept.
+//
+// The second result reports that the chunk consisted solely of such parts and carries
+// nothing else worth delivering (no finishReason, no grounding metadata), so a streaming
+// caller can skip it entirely.
+func stripEmptyThoughtParts(chunk []byte) ([]byte, bool) {
+	if !bytes.Contains(chunk, thoughtFieldMarker) {
+		return chunk, false
+	}
+	candidates := ojson.GetBytesNoCopy(chunk, "candidates")
+	if !candidates.IsArray() {
+		return chunk, false
+	}
+	var chunkDoc *ojson.Doc
+	removedAny := false
+	nothingLeft := true
+	for candidateIndex, candidate := range candidates.Array() {
+		parts := candidate.Get("content.parts")
+		kept := make([]string, 0, len(parts.Array()))
+		removed := false
+		for _, part := range parts.Array() {
+			if isEmptyThoughtPart(part) {
+				removed = true
+				continue
+			}
+			kept = append(kept, part.Raw)
+		}
+		if removed {
+			removedAny = true
+			if chunkDoc == nil {
+				chunkDoc = ojson.NewDoc(chunk)
+			}
+			_ = chunkDoc.SetRaw(fmt.Sprintf("candidates.%d.content.parts", candidateIndex), "["+strings.Join(kept, ",")+"]")
+		}
+		if len(kept) > 0 || candidate.Get("finishReason").String() != "" || candidate.Get("groundingMetadata").Exists() {
+			nothingLeft = false
+		}
+	}
+	if chunkDoc == nil {
+		return chunk, false
+	}
+	return chunkDoc.Bytes(), removedAny && nothingLeft
+}
+
+func isEmptyThoughtPart(part ojson.Result) bool {
+	if !part.IsObject() || !part.Get("thought").Bool() {
+		return false
+	}
+	for key, value := range part.Map() {
+		switch key {
+		case "thought":
+		case "text":
+			if value.String() != "" {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func restoreGeminiFunctionNames(chunk, originalRequestRawJSON []byte) []byte {
