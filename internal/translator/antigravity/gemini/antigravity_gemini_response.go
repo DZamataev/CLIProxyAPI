@@ -171,11 +171,14 @@ func ConvertAntigravityResponseToGemini(ctx context.Context, _ string, originalR
 				} else {
 					chunk = []byte(responseResult.Raw)
 				}
+				// Non-terminal usage arrives as cpaUsageMetadata (FilterSSEUsageMetadata);
+				// a real usageMetadata is the terminal count and must not be dropped with the parts.
+				hasUsage := responseResult.Get("usageMetadata").Exists()
 				chunk = restoreUsageMetadata(chunk)
 				chunk = restoreGeminiFunctionNames(chunk, originalRequestRawJSON)
 				var onlyEmptyThoughts bool
 				chunk, onlyEmptyThoughts = stripEmptyThoughtParts(chunk)
-				if onlyEmptyThoughts {
+				if onlyEmptyThoughts && !hasUsage {
 					return [][]byte{}
 				}
 			}
@@ -187,9 +190,10 @@ func ConvertAntigravityResponseToGemini(ctx context.Context, _ string, originalR
 				responseResultItems := responseResult.Array()
 				for i := 0; i < len(responseResultItems); i++ {
 					responseResultItem := responseResultItems[i]
-					if responseResultItem.Get("response").Exists() {
-						item, onlyEmptyThoughts := stripEmptyThoughtParts([]byte(responseResultItem.Get("response").Raw))
-						if !onlyEmptyThoughts {
+					if response := responseResultItem.Get("response"); response.Exists() {
+						hasUsage := response.Get("usageMetadata").Exists()
+						item, onlyEmptyThoughts := stripEmptyThoughtParts([]byte(response.Raw))
+						if !onlyEmptyThoughts || hasUsage {
 							_ = chunkDoc.SetRawBytes("-1", item)
 							keptItems++
 						}
