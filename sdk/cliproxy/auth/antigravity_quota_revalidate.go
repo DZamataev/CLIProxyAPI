@@ -3,13 +3,14 @@ package auth
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/MoeForge/moego/json"
@@ -30,10 +31,6 @@ import (
 // antigravityQuotaSummaryURL is a variable only so tests can point it at a local server.
 var antigravityQuotaSummaryURL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
 
-// antigravityQuotaRevalidateGuards holds one *sync.Mutex per Manager so two passes
-// never overlap, even when StartAutoRefresh restarts the worker mid-pass.
-var antigravityQuotaRevalidateGuards sync.Map
-
 const (
 	antigravityQuotaRevalidateTick        = time.Minute
 	antigravityQuotaRevalidateAuthTimeout = 30 * time.Second
@@ -43,7 +40,6 @@ const (
 	antigravityQuotaSummaryMaxBytes    = 1 << 20
 	antigravityQuotaDefaultMinCooldown = 10 * time.Minute
 	antigravityQuotaDefaultMinLeft     = 0.02
-	antigravityQuotaMaxErrorText       = 200
 )
 
 type antigravityQuotaRevalidateSettings struct {
@@ -142,7 +138,7 @@ type antigravityQuotaSummary struct {
 func antigravityQuotaFamilies(body []byte) (map[string]float64, error) {
 	var summary antigravityQuotaSummary
 	if errUnmarshal := json.Unmarshal(body, &summary); errUnmarshal != nil {
-		return nil, fmt.Errorf("decode quota summary: %w", errUnmarshal)
+		return nil, fmt.Errorf("%w: %w", errAntigravityQuotaDecode, errUnmarshal)
 	}
 	families := make(map[string]float64)
 	add := func(buckets []antigravityQuotaBucket) {
@@ -396,7 +392,7 @@ func (m *Manager) fetchAntigravityQuotaFamilies(ctx context.Context, auth *Auth,
 	defer func() { _ = resp.Body.Close() }()
 	data, errRead := io.ReadAll(io.LimitReader(resp.Body, antigravityQuotaSummaryMaxBytes))
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("quota summary returned HTTP %d", resp.StatusCode)
+		return nil, antigravityQuotaStatusError(resp.StatusCode)
 	}
 	if errRead != nil {
 		return nil, fmt.Errorf("read quota summary: %w", errRead)
@@ -404,12 +400,37 @@ func (m *Manager) fetchAntigravityQuotaFamilies(ctx context.Context, auth *Auth,
 	return antigravityQuotaFamilies(data)
 }
 
-func antigravityQuotaErrorText(err error) string {
-	text := strings.TrimSpace(err.Error())
-	if len(text) > antigravityQuotaMaxErrorText {
-		text = text[:antigravityQuotaMaxErrorText] + "…"
+var errAntigravityQuotaDecode = errors.New("decode quota summary")
+
+type antigravityQuotaStatusError int
+
+func (e antigravityQuotaStatusError) Error() string {
+	return fmt.Sprintf("quota summary returned HTTP %d", int(e))
+}
+func (e antigravityQuotaStatusError) StatusCode() int { return int(e) }
+
+// antigravityQuotaErrorCategory describes err for a log line without its text: executor
+// and token-endpoint errors carry upstream response bodies, which must never be logged.
+func antigravityQuotaErrorCategory(err error) string {
+	var withStatus interface{ StatusCode() int }
+	if errors.As(err, &withStatus) && withStatus.StatusCode() > 0 {
+		return fmt.Sprintf("HTTP %d", withStatus.StatusCode())
 	}
-	return text
+	var netErr net.Error
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, errAntigravityQuotaDecode):
+		return "decode error"
+	case errors.As(err, &netErr):
+		if netErr.Timeout() {
+			return "timeout"
+		}
+		return "network error"
+	}
+	return "error"
 }
 
 // revalidateAntigravityAuthQuota checks one auth: token (refreshed through the manager when
@@ -425,7 +446,7 @@ func (m *Manager) revalidateAntigravityAuthQuota(ctx context.Context, authID str
 	identity := formatAuthIdentity(current, "antigravity")
 	if exp, okExp := current.AccessTokenExpirationTime(); !okExp || exp.Before(time.Now().Add(antigravityQuotaTokenMargin)) {
 		if _, errRefresh := m.refreshAuthForRequest(authCtx, authID, ""); errRefresh != nil {
-			log.Warnf("antigravity quota revalidate: %s: token refresh failed, cooldowns kept: %s", identity, antigravityQuotaErrorText(errRefresh))
+			log.Warnf("antigravity quota revalidate: %s: token refresh failed, cooldowns kept: %s", identity, antigravityQuotaErrorCategory(errRefresh))
 			return
 		}
 	}
@@ -441,7 +462,7 @@ func (m *Manager) revalidateAntigravityAuthQuota(ctx context.Context, authID str
 	}
 	families, errFetch := m.fetchAntigravityQuotaFamilies(authCtx, snapshot, fence.projectID)
 	if errFetch != nil {
-		log.Warnf("antigravity quota revalidate: %s: quota summary failed, cooldowns kept: %s", identity, antigravityQuotaErrorText(errFetch))
+		log.Warnf("antigravity quota revalidate: %s: quota summary failed, cooldowns kept: %s", identity, antigravityQuotaErrorCategory(errFetch))
 		return
 	}
 
@@ -492,7 +513,7 @@ func (m *Manager) revalidateAntigravityAuthQuota(ctx context.Context, authID str
 		log.Infof("antigravity quota revalidate: released %s models=[%s] remaining=%s", identity, strings.Join(released, " "), strings.Join(remaining, ", "))
 	}
 	if errRelease != nil {
-		log.Warnf("antigravity quota revalidate: %s: persisting released cooldowns failed: %s", identity, antigravityQuotaErrorText(errRelease))
+		log.Warnf("antigravity quota revalidate: %s: persisting released cooldowns failed: %s", identity, antigravityQuotaErrorCategory(errRelease))
 	}
 }
 
@@ -520,12 +541,10 @@ func (m *Manager) antigravityQuotaCandidates(now time.Time, minCooldown time.Dur
 // revalidateAntigravityQuotaCooldowns runs one pass over all candidates, sequentially. It
 // returns false without doing anything when another pass of this Manager is running.
 func (m *Manager) revalidateAntigravityQuotaCooldowns(ctx context.Context, settings antigravityQuotaRevalidateSettings) bool {
-	guardValue, _ := antigravityQuotaRevalidateGuards.LoadOrStore(m, &sync.Mutex{})
-	guard := guardValue.(*sync.Mutex)
-	if !guard.TryLock() {
+	if !m.antigravityQuotaRevalidateMu.TryLock() {
 		return false
 	}
-	defer guard.Unlock()
+	defer m.antigravityQuotaRevalidateMu.Unlock()
 	for _, authID := range m.antigravityQuotaCandidates(time.Now(), settings.minCooldown) {
 		if ctx.Err() != nil {
 			break

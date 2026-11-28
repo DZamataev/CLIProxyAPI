@@ -254,6 +254,9 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+	// antigravityQuotaRevalidateMu keeps Antigravity quota revalidation passes from
+	// overlapping, also across StartAutoRefresh restarts (fork-only).
+	antigravityQuotaRevalidateMu sync.Mutex
 	// refreshJobs retains queued and running jobs across loop restarts under m.mu.
 	refreshJobs map[string]*authRefreshJob
 

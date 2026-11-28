@@ -3,10 +3,13 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +18,8 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
 // agQuotaTestExecutor stands in for the Antigravity executor: HttpRequest injects the
@@ -27,6 +32,7 @@ type agQuotaTestExecutor struct {
 	bodies       []string
 	contentTypes []string
 	refreshErr   error
+	fetchErr     error
 	duringFetch  func()
 }
 
@@ -68,7 +74,11 @@ func (e *agQuotaTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *
 	e.bodies = append(e.bodies, string(body))
 	e.contentTypes = append(e.contentTypes, req.Header.Get("Content-Type"))
 	hook := e.duringFetch
+	fetchErr := e.fetchErr
 	e.mu.Unlock()
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
 	if hook != nil {
 		hook()
 	}
@@ -816,5 +826,100 @@ func TestAntigravityQuotaRevalidateLoop_HotReloadAndStop(t *testing.T) {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("worker did not stop on context cancel")
+	}
+}
+
+// agQuotaBodyError mimics the executor's statusErr: Error() returns the upstream body.
+type agQuotaBodyError struct {
+	status int
+	body   string
+}
+
+func (e agQuotaBodyError) Error() string   { return e.body }
+func (e agQuotaBodyError) StatusCode() int { return e.status }
+
+func TestAntigravityQuotaRevalidate_WarningsNeverLogUpstreamBodies(t *testing.T) {
+	const marker = "MARKER-7f3a"
+	body := `{"error":"invalid_grant","secret":"` + marker + `"}`
+	cases := []struct {
+		name    string
+		setup   func(exec *agQuotaTestExecutor, auth *Auth)
+		handler http.HandlerFunc
+	}{
+		{name: "refresh failure", setup: func(exec *agQuotaTestExecutor, auth *Auth) {
+			exec.refreshErr = agQuotaBodyError{status: http.StatusBadRequest, body: body}
+			auth.Metadata["expired"] = time.Now().Add(2 * time.Minute).Format(time.RFC3339)
+			auth.Metadata["refresh_token"] = "rt-1"
+		}},
+		{name: "fetch error", setup: func(exec *agQuotaTestExecutor, _ *Auth) {
+			exec.fetchErr = agQuotaBodyError{status: http.StatusBadRequest, body: body}
+		}},
+		{name: "fetch non-2xx", handler: func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, body, http.StatusBadRequest)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := tc.handler
+			if handler == nil {
+				handler = agQuotaSummaryHandler(agQuotaSummaryGeminiOK)
+			}
+			manager, exec := newAGQuotaTestManager(t, handler)
+			const id, key = "ag-quota-logs", "gemini-4-neon-xhigh"
+			auth := agQuotaAuth(id, map[string]*ModelState{key: agQuotaCooldown(time.Hour)})
+			if tc.setup != nil {
+				tc.setup(exec, auth)
+			}
+			registerAGQuotaAuth(t, manager, auth)
+
+			logger := log.StandardLogger()
+			previousLevel := logger.GetLevel()
+			previousHooks := logger.ReplaceHooks(make(log.LevelHooks))
+			hook := logtest.NewLocal(logger)
+			logger.SetLevel(log.DebugLevel)
+			t.Cleanup(func() {
+				logger.ReplaceHooks(previousHooks)
+				logger.SetLevel(previousLevel)
+			})
+
+			manager.revalidateAntigravityQuotaCooldowns(context.Background(), agQuotaTestSettings)
+
+			assertAGQuotaCooled(t, manager, id, key)
+			sawStatus := false
+			for _, entry := range hook.AllEntries() {
+				line, _ := entry.String()
+				// Only the revalidator's own lines are checked: the shared refresh path in
+				// conductor_refresh.go logs the token endpoint body itself (pre-existing,
+				// sanitized at warn level, raw at debug level) for every failed refresh.
+				ours := strings.Contains(entry.Message, "antigravity quota revalidate")
+				if ours && (strings.Contains(line, marker) || strings.Contains(line, "invalid_grant")) {
+					t.Fatalf("upstream body logged: %s", line)
+				}
+				if entry.Level == log.WarnLevel && strings.Contains(entry.Message, "antigravity quota revalidate") && strings.Contains(entry.Message, "HTTP 400") {
+					sawStatus = true
+				}
+			}
+			if !sawStatus {
+				t.Fatalf("no revalidate warning with HTTP 400; entries: %d", len(hook.AllEntries()))
+			}
+		})
+	}
+}
+
+func TestAntigravityQuotaErrorCategory(t *testing.T) {
+	_, decodeErr := antigravityQuotaFamilies([]byte(`{bad`))
+	cases := map[string]error{
+		"HTTP 400":      agQuotaBodyError{status: http.StatusBadRequest, body: "secret body"},
+		"HTTP 503":      antigravityQuotaStatusError(http.StatusServiceUnavailable),
+		"timeout":       fmt.Errorf("wrapped: %w", context.DeadlineExceeded),
+		"canceled":      context.Canceled,
+		"decode error":  decodeErr,
+		"network error": &net.OpError{Op: "dial", Err: errors.New("connection refused")},
+		"error":         errors.New("some body text"),
+	}
+	for want, err := range cases {
+		if got := antigravityQuotaErrorCategory(err); got != want {
+			t.Errorf("antigravityQuotaErrorCategory(%T) = %q, want %q", err, got, want)
+		}
 	}
 }
