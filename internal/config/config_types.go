@@ -286,6 +286,20 @@ type AntigravityConfig struct {
 	// is explicitly configured. Set to "0", "off", "false", "none", or
 	// "disabled" to explicitly disable the pause.
 	TOSPauseWindow string `yaml:"tos-pause-window,omitempty" json:"tos-pause-window,omitempty"`
+
+	// QuotaRevalidateInterval enables periodic re-checks of long model quota cooldowns against
+	// Google's retrieveUserQuotaSummary; cooldowns whose quota family still has quota left are
+	// released early. Go duration string; "", "0", "off", "false", "none" or "disabled" (the
+	// default) disables it. Invalid values disable it with a warning.
+	QuotaRevalidateInterval string `yaml:"quota-revalidate-interval,omitempty" json:"quota-revalidate-interval,omitempty"`
+
+	// QuotaRevalidateMinCooldown limits re-checks to cooldowns with at least this much time left.
+	// Go duration string, default "10m".
+	QuotaRevalidateMinCooldown string `yaml:"quota-revalidate-min-cooldown,omitempty" json:"quota-revalidate-min-cooldown,omitempty"`
+
+	// QuotaRevalidateMinLeft releases a cooldown only when its quota family's remaining fraction
+	// is greater than this value (0..1). Default 0.02.
+	QuotaRevalidateMinLeft *float64 `yaml:"quota-revalidate-min-left,omitempty" json:"quota-revalidate-min-left,omitempty"`
 }
 
 // AntigravityConnectionPoolConfig controls upstream HTTP/1.1 connection pooling behavior for Antigravity.
