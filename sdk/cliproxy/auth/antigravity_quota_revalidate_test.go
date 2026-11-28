@@ -745,6 +745,7 @@ func TestAntigravityQuotaRevalidateSettingsFromConfig(t *testing.T) {
 		{name: "off", cfg: internalconfig.AntigravityConfig{QuotaRevalidateInterval: "OFF"}, minCooldown: 10 * time.Minute, minLeft: 0.02},
 		{name: "zero", cfg: internalconfig.AntigravityConfig{QuotaRevalidateInterval: "0"}, minCooldown: 10 * time.Minute, minLeft: 0.02},
 		{name: "enabled", cfg: internalconfig.AntigravityConfig{QuotaRevalidateInterval: "15m", QuotaRevalidateMinCooldown: "0", QuotaRevalidateMinLeft: f(0)}, interval: 15 * time.Minute},
+		{name: "sub-minute interval", cfg: internalconfig.AntigravityConfig{QuotaRevalidateInterval: "30s"}, interval: 30 * time.Second, minCooldown: 10 * time.Minute, minLeft: 0.02, warn: true},
 		{name: "garbage interval", cfg: internalconfig.AntigravityConfig{QuotaRevalidateInterval: "soon"}, minCooldown: 10 * time.Minute, minLeft: 0.02, warn: true},
 		{name: "negative interval", cfg: internalconfig.AntigravityConfig{QuotaRevalidateInterval: "-5m"}, minCooldown: 10 * time.Minute, minLeft: 0.02, warn: true},
 		{name: "bad min-cooldown", cfg: internalconfig.AntigravityConfig{QuotaRevalidateInterval: "15m", QuotaRevalidateMinCooldown: "-1m"}, interval: 15 * time.Minute, minCooldown: 10 * time.Minute, minLeft: 0.02, warn: true},

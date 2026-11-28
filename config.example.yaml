@@ -1287,7 +1287,7 @@ oauth:
       # tos-pause-window: "0"         # optional: pool-wide protective pause after the first 403 TOS_VIOLATION
                                     # (default "0" = disabled; set a positive duration such as "6h" to enable pool-wide pause)
       # quota-revalidate-interval: "0"      # optional: re-check long quota cooldowns against Google's quota summary
-                                          # and release those whose quota family still has quota left (default "0" = disabled, e.g. "15m")
+                                          # and release those whose quota family still has quota left (default "0" = disabled, e.g. "15m"; checked once a minute)
       # quota-revalidate-min-cooldown: "10m" # optional: only re-check cooldowns with at least this much left (default 10m)
       # quota-revalidate-min-left: 0.02     # optional: release when the family's remaining fraction is above this (default 0.02)
       # Use credits as a last resort after free-tier Claude quota is exhausted.

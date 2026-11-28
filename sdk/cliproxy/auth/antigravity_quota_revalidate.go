@@ -69,6 +69,10 @@ func antigravityQuotaRevalidateSettingsFromConfig(cfg *internalconfig.Config) (a
 			warnings = append(warnings, fmt.Sprintf("quota-revalidate-interval %q is invalid, revalidation disabled", raw))
 		} else {
 			settings.interval = interval
+			if interval < antigravityQuotaRevalidateTick {
+				// The worker wakes once per tick, so a shorter interval runs once per tick.
+				warnings = append(warnings, fmt.Sprintf("quota-revalidate-interval %q is below the %s check tick, revalidating every %s", raw, antigravityQuotaRevalidateTick, antigravityQuotaRevalidateTick))
+			}
 		}
 	}
 	if raw := strings.TrimSpace(cfg.Antigravity.QuotaRevalidateMinCooldown); raw != "" {
