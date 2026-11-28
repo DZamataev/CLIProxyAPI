@@ -325,6 +325,12 @@ func IsModelSubstituted(requested, served string) bool {
 		return false
 	}
 
+	// Some catalogs (Antigravity) name a model with its default thinking level, e.g.
+	// gemini-4-neon-xhigh, while the response reports the base name gemini-4-neon.
+	if isThinkingLevelVariant(cleanReq, cleanSrv) || isThinkingLevelVariant(cleanSrv, cleanReq) {
+		return false
+	}
+
 	reqNoLatest := strings.TrimSuffix(cleanReq, "-latest")
 	srvNoLatest := strings.TrimSuffix(cleanSrv, "-latest")
 	if reqNoLatest == srvNoLatest {
@@ -335,6 +341,21 @@ func IsModelSubstituted(requested, served string) bool {
 	}
 
 	return true
+}
+
+// isThinkingLevelVariant reports whether variant is base plus a thinking-level suffix
+// such as -high or -xhigh.
+func isThinkingLevelVariant(base, variant string) bool {
+	prefix := base + "-"
+	if !strings.HasPrefix(variant, prefix) {
+		return false
+	}
+	switch variant[len(prefix):] {
+	case "minimal", "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
 }
 
 func isDatedModelAlias(base, dated string) bool {
